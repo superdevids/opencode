@@ -39,6 +39,32 @@ describe("session.retry.delay", () => {
     expect(delays).toStrictEqual([2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000, 30000, 30000])
   })
 
+  test("caps delay at 30 seconds when headers are present but empty", () => {
+    const error = apiError({})
+    const delays = Array.from({ length: 10 }, (_, index) => SessionRetry.delay(index + 1, error))
+    expect(delays).toStrictEqual([2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000, 30000, 30000])
+  })
+
+  test("caps delay at 30 seconds when retry-after headers are unparseable", () => {
+    const error = apiError({ "retry-after": "never", "retry-after-ms": "nope" })
+    const delays = Array.from({ length: 10 }, (_, index) => SessionRetry.delay(index + 1, error))
+    expect(delays).toStrictEqual([2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000, 30000, 30000])
+  })
+
+  test("honors a valid retry-after header instead of the exponential fallback", () => {
+    const error = apiError({ "retry-after": "5" })
+    expect(SessionRetry.delay(1, error)).toBe(5000)
+    expect(SessionRetry.delay(20, error)).toBe(5000)
+  })
+
+  test("grows exponentially but never exceeds the safe cap without header guidance", () => {
+    const error = apiError({})
+    expect(SessionRetry.delay(1, error)).toBe(2000)
+    expect(SessionRetry.delay(5, error)).toBe(30000)
+    expect(SessionRetry.delay(20, error)).toBe(30000)
+    expect(SessionRetry.delay(50, error)).toBe(SessionRetry.RETRY_MAX_DELAY_NO_HEADERS)
+  })
+
   test("prefers retry-after-ms when shorter than exponential", () => {
     const error = apiError({ "retry-after-ms": "1500" })
     expect(SessionRetry.delay(4, error)).toBe(1500)

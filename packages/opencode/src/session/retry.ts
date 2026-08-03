@@ -33,35 +33,32 @@ function cap(ms: number) {
 }
 
 export function delay(attempt: number, error?: SessionV1.APIError) {
-  if (error) {
-    const headers = error.data.responseHeaders
-    if (headers) {
-      const retryAfterMs = headers["retry-after-ms"]
-      if (retryAfterMs) {
-        const parsedMs = Number.parseFloat(retryAfterMs)
-        if (!Number.isNaN(parsedMs)) {
-          return cap(parsedMs)
-        }
-      }
-
-      const retryAfter = headers["retry-after"]
-      if (retryAfter) {
-        const parsedSeconds = Number.parseFloat(retryAfter)
-        if (!Number.isNaN(parsedSeconds)) {
-          // convert seconds to milliseconds
-          return cap(Math.ceil(parsedSeconds * 1000))
-        }
-        // Try parsing as HTTP date format
-        const parsed = Date.parse(retryAfter) - Date.now()
-        if (!Number.isNaN(parsed) && parsed > 0) {
-          return cap(Math.ceil(parsed))
-        }
-      }
-
-      return cap(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1))
+  const retryAfterMs = error?.data.responseHeaders?.["retry-after-ms"]
+  if (retryAfterMs) {
+    const parsedMs = Number.parseFloat(retryAfterMs)
+    if (!Number.isNaN(parsedMs)) {
+      return cap(parsedMs)
     }
   }
 
+  const retryAfter = error?.data.responseHeaders?.["retry-after"]
+  if (retryAfter) {
+    const parsedSeconds = Number.parseFloat(retryAfter)
+    if (!Number.isNaN(parsedSeconds)) {
+      // convert seconds to milliseconds
+      return cap(Math.ceil(parsedSeconds * 1000))
+    }
+    // Try parsing as HTTP date format
+    const parsed = Date.parse(retryAfter) - Date.now()
+    if (!Number.isNaN(parsed) && parsed > 0) {
+      return cap(Math.ceil(parsed))
+    }
+  }
+
+  // Explicit provider guidance (a parseable retry-after header) is honored
+  // above. Everything else — missing, empty, or unparseable headers — uses the
+  // bounded backoff so retries can never freeze for the 32-bit timer cap
+  // (~24.8 days) just because a provider sent an empty headers object.
   return cap(Math.min(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1), RETRY_MAX_DELAY_NO_HEADERS))
 }
 
