@@ -1150,6 +1150,29 @@ export class NoModelsError extends Schema.TaggedErrorClass<NoModelsError>()("Pro
 export type DefaultModelError = ModelNotFoundError | NoProvidersError | NoModelsError
 export type Error = ModelNotFoundError | InitError | NoProvidersError | NoModelsError
 
+// Discovery is best-effort enrichment on top of the static model catalog, but
+// failures must not be silently swallowed — users would lose discovered models
+// with zero diagnostic. Propagate the failure as a typed InitError so the
+// caller decides how to surface it.
+export function mergeDiscoveredModels(
+  providers: Record<ProviderV2.ID, Info>,
+  providerID: ProviderV2.ID,
+  discover: CustomDiscoverModels,
+): Effect.Effect<void, InitError> {
+  return Effect.tryPromise({
+    try: () => discover(),
+    catch: (cause) => new InitError({ providerID, cause }),
+  }).pipe(
+    Effect.map((discovered) => {
+      for (const [modelID, model] of Object.entries(discovered)) {
+        if (!providers[providerID].models[modelID]) {
+          providers[providerID].models[modelID] = model
+        }
+      }
+    }),
+  )
+}
+
 export interface Interface {
   readonly list: () => Effect.Effect<Record<ProviderV2.ID, Info>>
   readonly getProvider: (providerID: ProviderV2.ID) => Effect.Effect<Info>
@@ -1596,16 +1619,15 @@ const layer = Layer.effect(
 
         const gitlab = ProviderV2.ID.make("gitlab")
         if (discoveryLoaders[gitlab] && providers[gitlab] && isProviderAllowed(gitlab)) {
-          yield* Effect.promise(async () => {
-            try {
-              const discovered = await discoveryLoaders[gitlab]()
-              for (const [modelID, model] of Object.entries(discovered)) {
-                if (!providers[gitlab].models[modelID]) {
-                  providers[gitlab].models[modelID] = model
-                }
-              }
-            } catch (e) {}
-          })
+          // GitLab Duo discovery is best-effort on top of the static catalog,
+          // but failures were silently swallowed in an empty catch — users lost
+          // discovered models with zero diagnostic. Surface the failure as a
+          // warning while the static catalog still loads.
+          yield* mergeDiscoveredModels(providers, gitlab, discoveryLoaders[gitlab]).pipe(
+            Effect.catch((error) =>
+              Effect.logWarning("gitlab model discovery failed", { providerID: gitlab, error: error.message }),
+            ),
+          )
         }
 
         for (const [id, provider] of Object.entries(providers)) {
