@@ -95,7 +95,6 @@ function sdkKey(npm: string): string | undefined {
   return undefined
 }
 
-// TODO: fix this stupid inefficient dogshit function
 function normalizeMessages(
   msgs: ModelMessage[],
   model: Provider.Model,
@@ -116,21 +115,34 @@ function normalizeMessages(
     return content
   }
 
-  msgs = msgs.map((msg) => {
+  const modelID = model.api.id.toLowerCase()
+  const filtersEmpty = model.api.npm === "@ai-sdk/anthropic" || model.api.npm === "@ai-sdk/amazon-bedrock"
+  const filterKey = model.api.npm === "@ai-sdk/anthropic" ? "anthropic" : "bedrock"
+  const scrubsClaude = model.api.id.includes("claude")
+  const isMistralFamily =
+    model.providerID === "mistral" ||
+    ["mistral", "devstral", "codestral", "pixtral", "mixtral"].some((family) => modelID.includes(family))
+
+  // Pass 1: sanitize surrogates in place and apply the Anthropic/Bedrock
+  // empty-content filtering. Both are element-wise, so they share one scan
+  // instead of the previous two full-array passes.
+  const processed: ModelMessage[] = []
+  for (let i = 0; i < msgs.length; i++) {
+    const msg = msgs[i]
     switch (msg.role) {
       case "tool":
-        if (!Array.isArray(msg.content)) return msg
+        if (!Array.isArray(msg.content)) break
         msg.content = msg.content.map((content) => {
           if (content.type === "tool-result") {
             return sanitizeToolResultOutput(content)
           }
           return content
         })
-        return msg
+        break
 
       case "system":
         msg.content = sanitizeSurrogates(msg.content)
-        return msg
+        break
 
       case "user":
         if (typeof msg.content === "string") {
@@ -143,7 +155,7 @@ function normalizeMessages(
             return content
           })
         }
-        return msg
+        break
 
       case "assistant":
         if (typeof msg.content === "string") {
@@ -159,72 +171,46 @@ function normalizeMessages(
             return content
           })
         }
-        return msg
+        break
     }
-  })
 
-  // Anthropic rejects messages with empty content - filter out empty string messages
-  // and remove empty text/reasoning parts from array content
-  if (model.api.npm === "@ai-sdk/anthropic") {
-    msgs = msgs
-      .map((msg) => {
-        if (typeof msg.content === "string") {
-          if (msg.content === "") return undefined
-          return msg
-        }
-        if (!Array.isArray(msg.content)) return msg
-        const filtered = msg.content.filter((part) => {
-          if (part.type === "text") {
-            return part.text !== ""
-          }
-          if (part.type === "reasoning") {
-            return (
-              part.text.trim().length > 0 ||
-              part.providerOptions?.anthropic?.signature != null ||
-              part.providerOptions?.anthropic?.redactedData != null
-            )
-          }
-          return true
-        })
-        if (filtered.length === 0) return undefined
-        return { ...msg, content: filtered }
-      })
-      .filter((msg): msg is ModelMessage => msg !== undefined && msg.content !== "")
+    // Anthropic/Bedrock reject messages with empty content - filter out empty
+    // string messages and remove empty text/reasoning parts from array content.
+    if (!filtersEmpty) {
+      processed.push(msg)
+      continue
+    }
+    if (typeof msg.content === "string") {
+      if (msg.content !== "") processed.push(msg)
+      continue
+    }
+    if (!Array.isArray(msg.content)) {
+      processed.push(msg)
+      continue
+    }
+    const filtered = msg.content.filter((part) => {
+      if (part.type === "text") {
+        return part.text !== ""
+      }
+      if (part.type === "reasoning") {
+        return (
+          part.text.trim().length > 0 ||
+          part.providerOptions?.[filterKey]?.signature != null ||
+          part.providerOptions?.[filterKey]?.redactedData != null
+        )
+      }
+      return true
+    })
+    if (filtered.length === 0) continue
+    processed.push({ ...msg, content: filtered } as ModelMessage)
   }
 
-  // Bedrock specific transforms
-  if (model.api.npm === "@ai-sdk/amazon-bedrock") {
-    msgs = msgs
-      .map((msg) => {
-        if (typeof msg.content === "string") {
-          if (msg.content === "") return undefined
-          return msg
-        }
-        if (!Array.isArray(msg.content)) return msg
-        const filtered = msg.content.filter((part) => {
-          if (part.type === "text") {
-            return part.text !== ""
-          }
-          if (part.type === "reasoning") {
-            return (
-              part.text.trim().length > 0 ||
-              part.providerOptions?.bedrock?.signature != null ||
-              part.providerOptions?.bedrock?.redactedData != null
-            )
-          }
-          return true
-        })
-        if (filtered.length === 0) return undefined
-        return { ...msg, content: filtered }
-      })
-      .filter((msg): msg is ModelMessage => msg !== undefined && msg.content !== "")
-  }
-
-  if (model.api.id.includes("claude")) {
+  if (scrubsClaude) {
     const scrub = (id: string) => id.replace(/[^a-zA-Z0-9_-]/g, "_")
-    msgs = msgs.map((msg) => {
+    for (let i = 0; i < processed.length; i++) {
+      const msg = processed[i]
       if (msg.role === "assistant" && Array.isArray(msg.content)) {
-        return {
+        processed[i] = {
           ...msg,
           content: msg.content.map((part) => {
             if (part.type === "tool-call" || part.type === "tool-result") {
@@ -233,9 +219,10 @@ function normalizeMessages(
             return part
           }),
         }
+        continue
       }
       if (msg.role === "tool" && Array.isArray(msg.content)) {
-        return {
+        processed[i] = {
           ...msg,
           content: msg.content.map((part) => {
             if (part.type === "tool-result") {
@@ -245,15 +232,12 @@ function normalizeMessages(
           }),
         }
       }
-      return msg
-    })
+    }
   }
 
-  const modelID = model.api.id.toLowerCase()
-  if (
-    model.providerID === "mistral" ||
-    ["mistral", "devstral", "codestral", "pixtral", "mixtral"].some((family) => modelID.includes(family))
-  ) {
+  // Mistral family: scrubbed tool call IDs plus an assistant separator after
+  // tool messages, and the reasoning transforms below are skipped.
+  if (isMistralFamily) {
     const scrub = (id: string) => {
       return id
         .replace(/[^a-zA-Z0-9]/g, "") // Remove non-alphanumeric characters
@@ -261,9 +245,9 @@ function normalizeMessages(
         .padEnd(9, "0") // Pad with zeros if less than 9 characters
     }
     const result: ModelMessage[] = []
-    for (let i = 0; i < msgs.length; i++) {
-      const msg = msgs[i]
-      const nextMsg = msgs[i + 1]
+    for (let i = 0; i < processed.length; i++) {
+      const msg = processed[i]
+      const nextMsg = processed[i + 1]
 
       if (msg.role === "assistant" && Array.isArray(msg.content)) {
         msg.content = msg.content.map((part) => {
@@ -299,37 +283,51 @@ function normalizeMessages(
     return result
   }
 
-  // Deepseek requires all assistant messages to have reasoning on them
-  if (model.api.id.toLowerCase().includes("deepseek")) {
-    msgs = msgs.map((msg) => {
-      if (msg.role !== "assistant") return msg
-      if (Array.isArray(msg.content)) {
-        if (msg.content.some((part) => part.type === "reasoning")) return msg
-        return { ...msg, content: [...msg.content, { type: "reasoning", text: "" }] }
-      }
-      return {
-        ...msg,
-        content: [
-          ...(msg.content ? [{ type: "text" as const, text: msg.content }] : []),
-          { type: "reasoning" as const, text: "" },
-        ],
-      }
-    })
-  }
-
-  if (
+  // DeepSeek requires all assistant messages to have reasoning on them;
+  // interleaved providers want reasoning hoisted into providerOptions. Both
+  // are element-wise, so they share one scan. The interleaved capability is
+  // read lazily here, after the Mistral early return — matching the original
+  // so models without `capabilities` throw at the same point.
+  const addsDeepseekReasoning = modelID.includes("deepseek")
+  const interleavedField =
     typeof model.capabilities.interleaved === "object" &&
     model.capabilities.interleaved.field &&
     model.api.npm !== "@openrouter/ai-sdk-provider"
-  ) {
-    const field = model.capabilities.interleaved.field
-    return msgs.map((msg) => {
-      if (msg.role === "assistant" && Array.isArray(msg.content)) {
-        const reasoningParts = msg.content.filter((part: any) => part.type === "reasoning")
-        const reasoningText = reasoningParts.map((part: any) => part.text).join("")
+      ? model.capabilities.interleaved.field
+      : undefined
 
-        // Filter out reasoning parts from content
-        const filteredContent = msg.content.filter((part: any) => part.type !== "reasoning")
+  if (addsDeepseekReasoning || interleavedField) {
+    return processed.map((msg) => {
+      // Deepseek requires all assistant messages to have reasoning on them.
+      // Note: this must not early-return — the interleaved transform below
+      // still runs for assistant messages that already carry reasoning parts.
+      if (addsDeepseekReasoning && msg.role === "assistant") {
+        if (Array.isArray(msg.content)) {
+          if (!msg.content.some((part) => part.type === "reasoning")) {
+            msg = { ...msg, content: [...msg.content, { type: "reasoning", text: "" }] }
+          }
+        } else {
+          msg = {
+            ...msg,
+            content: [
+              ...(msg.content ? [{ type: "text" as const, text: msg.content }] : []),
+              { type: "reasoning" as const, text: "" },
+            ],
+          }
+        }
+      }
+
+      if (interleavedField && msg.role === "assistant" && Array.isArray(msg.content)) {
+        // Collect reasoning parts and strip them from content in one pass.
+        const reasoningTexts: string[] = []
+        const filteredContent = msg.content.filter((part) => {
+          if (part.type === "reasoning") {
+            reasoningTexts.push(part.text)
+            return false
+          }
+          return true
+        })
+        const reasoningText = reasoningTexts.join("")
 
         // Include reasoning_content | reasoning_details directly on the message for all assistant messages.
         // Always set the field even when empty — some providers (e.g. DeepSeek) may return empty
@@ -341,7 +339,7 @@ function normalizeMessages(
             ...msg.providerOptions,
             openaiCompatible: {
               ...msg.providerOptions?.openaiCompatible,
-              [field]: reasoningText,
+              [interleavedField]: reasoningText,
             },
           },
         }
@@ -351,7 +349,7 @@ function normalizeMessages(
     })
   }
 
-  return msgs
+  return processed
 }
 
 function applyCaching(msgs: ModelMessage[], model: Provider.Model): ModelMessage[] {

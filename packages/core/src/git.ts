@@ -455,10 +455,13 @@ const layer = Layer.effect(
           )
         : new Set<string>()
       const allowed = candidates.filter((item) => !ignored.has(item))
+      // Set lookups keep refresh linear instead of quadratic in the number of
+      // changed files when many untracked files must be checked by size.
+      const allowedSet = new Set(allowed)
       const maximum = input.maximumUntrackedFileBytes
       const skipped = maximum
         ? (yield* Effect.forEach(
-            untracked.filter((item) => allowed.includes(item)),
+            untracked.filter((item) => allowedSet.has(item)),
             (item) =>
               fs.stat(path.join(input.repository.worktree, item)).pipe(
                 Effect.map((info) =>
@@ -469,7 +472,8 @@ const layer = Layer.effect(
             { concurrency: 8 },
           )).filter((item): item is RelativePath => item !== undefined)
         : []
-      const stage = allowed.filter((item) => !skipped.includes(RelativePath.make(item)))
+      const skippedSet = new Set(skipped)
+      const stage = allowed.filter((item) => !skippedSet.has(RelativePath.make(item)))
       const remove = [...ignored, ...skipped]
       if (remove.length)
         yield* repositoryOperation(
