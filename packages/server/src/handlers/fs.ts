@@ -1,5 +1,6 @@
 import { FileSystem } from "@opencode-ai/core/filesystem"
 import { RelativePath } from "@opencode-ai/core/schema"
+import { PathEscapeError } from "@opencode-ai/protocol/errors"
 import { Effect } from "effect"
 import { HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
@@ -11,11 +12,18 @@ export const FileSystemHandler = HttpApiBuilder.group(Api, "server.fs", (handler
     return handlers
       .handleRaw("fs.read", (ctx) =>
         Effect.gen(function* () {
-          const file = yield* (yield* FileSystem.Service).read({
-            path: RelativePath.make(
-              decodeURIComponent(new URL(ctx.request.url, "http://localhost").pathname.slice(13)),
-            ),
-          })
+          const file = yield* (yield* FileSystem.Service)
+            .read({
+              path: RelativePath.make(
+                decodeURIComponent(new URL(ctx.request.url, "http://localhost").pathname.slice(13)),
+              ),
+            })
+            .pipe(
+              Effect.catchTag(
+                "FileSystem.PathEscapeError",
+                (error) => new PathEscapeError({ message: error.message }),
+              ),
+            )
           return HttpServerResponse.uint8Array(file.content, { contentType: file.mime })
         }),
       )
@@ -23,7 +31,12 @@ export const FileSystemHandler = HttpApiBuilder.group(Api, "server.fs", (handler
         response(
           Effect.gen(function* () {
             const fs = yield* FileSystem.Service
-            return yield* fs.list(ctx.query)
+            return yield* fs.list(ctx.query).pipe(
+              Effect.catchTag(
+                "FileSystem.PathEscapeError",
+                (error) => new PathEscapeError({ message: error.message }),
+              ),
+            )
           }),
         ),
       )

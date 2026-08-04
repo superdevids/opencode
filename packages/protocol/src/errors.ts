@@ -109,3 +109,11 @@ export class PtyNotFoundError extends Schema.TaggedErrorClass<PtyNotFoundError>(
   },
   { httpApiStatus: 404 },
 ) {}
+
+export class PathEscapeError extends Schema.TaggedErrorClass<PathEscapeError>()(
+  "PathEscapeError",
+  {
+    message: Schema.String,
+  },
+  { httpApiStatus: 403 },
+) {}

@@ -46,9 +46,16 @@ export class GrepInput extends Schema.Class<GrepInput>("FileSystem.GrepInput")({
 
 export const Event = FileSystem.Event
 
+export class PathEscapeError extends Schema.TaggedErrorClass<PathEscapeError>()("FileSystem.PathEscapeError", {
+  message: Schema.String,
+}) {}
+
 export interface Interface {
-  readonly read: (input: ReadInput) => Effect.Effect<{ readonly content: Uint8Array; readonly mime: string }>
-  readonly list: (input?: ListInput) => Effect.Effect<Entry[]>
+  readonly read: (input: ReadInput) => Effect.Effect<
+    { readonly content: Uint8Array; readonly mime: string },
+    PathEscapeError
+  >
+  readonly list: (input?: ListInput) => Effect.Effect<Entry[], PathEscapeError>
   readonly find: (input: FindInput) => Effect.Effect<Entry[]>
   readonly glob: (input: GlobInput) => Effect.Effect<readonly Entry[]>
   readonly grep: (input: GrepInput) => Effect.Effect<readonly Match[]>
@@ -63,12 +70,18 @@ const baseLayer = Layer.effect(
     const location = yield* Location.Service
     const search = yield* FileSystemSearch.Service
     const root = yield* fs.realPath(location.directory).pipe(Effect.orDie)
+    // Paths are resolved to a concrete real path once here and every read/list operation
+    // below uses that resolved path instead of re-resolving per call, so the escape checks
+    // and the I/O operate on the same path. A symlink swap on a parent directory between
+    // `realPath` and the I/O call could still redirect the operation; closing that window
+    // fully requires dirfd-pinned resolution (e.g. openat with RESOLVE_BENEATH), which the
+    // platform FileSystem API does not expose, so the residual TOCTOU risk is accepted.
     const resolve = Effect.fnUntraced(function* (input?: RelativePath) {
       const absolute = path.resolve(location.directory, input ?? ".")
       if (!FSUtil.contains(location.directory, absolute))
-        return yield* Effect.die(new Error("Path escapes the location"))
+        return yield* new PathEscapeError({ message: "Path escapes the location" })
       const real = yield* fs.realPath(absolute).pipe(Effect.orDie)
-      if (!FSUtil.contains(root, real)) return yield* Effect.die(new Error("Path escapes the location"))
+      if (!FSUtil.contains(root, real)) return yield* new PathEscapeError({ message: "Path escapes the location" })
       return { absolute, real, directory: location.directory, root }
     })
     return Service.of({

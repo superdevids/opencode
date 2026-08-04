@@ -4,7 +4,7 @@ import { FileSystem } from "@opencode-ai/core/filesystem"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath, RelativePath } from "@opencode-ai/core/schema"
-import { effectCmd } from "../../effect-cmd"
+import { effectCmd, fail } from "../../effect-cmd"
 import { cmd } from "../cmd"
 
 const filesystem = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
@@ -39,6 +39,9 @@ const FileReadCommand = effectCmd({
     }),
   handler: Effect.fn("Cli.debug.file.read")(function* (args) {
     const file = yield* filesystem(FileSystem.Service.use((svc) => svc.read({ path: RelativePath.make(args.path) })))
+      .pipe(
+        Effect.catchTag("FileSystem.PathEscapeError", (error) => fail(error.message)),
+      )
     process.stdout.write(
       JSON.stringify(
         { content: Buffer.from(file.content).toString("base64"), encoding: "base64", mime: file.mime },
@@ -60,6 +63,9 @@ const FileListCommand = effectCmd({
     }),
   handler: Effect.fn("Cli.debug.file.list")(function* (args) {
     const files = yield* filesystem(FileSystem.Service.use((svc) => svc.list({ path: RelativePath.make(args.path) })))
+      .pipe(
+        Effect.catchTag("FileSystem.PathEscapeError", (error) => fail(error.message)),
+      )
     process.stdout.write(JSON.stringify(files, null, 2) + EOL)
   }),
 })

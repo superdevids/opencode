@@ -762,7 +762,7 @@ export function make(options: ClientOptions) {
             path: `/api/fs/list`,
             query: { location: input?.["location"], path: input?.["path"] },
             successStatus: 200,
-            declaredStatuses: [401, 400],
+            declaredStatuses: [403, 401, 400],
             empty: false,
           },
           requestOptions,

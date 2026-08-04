@@ -1,7 +1,7 @@
 import fs from "fs/promises"
 import path from "path"
 import { describe, expect } from "bun:test"
-import { Effect, Exit, Layer } from "effect"
+import { Effect, Layer } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FileSystem } from "@opencode-ai/core/filesystem"
 import { Location } from "@opencode-ai/core/location"
@@ -25,6 +25,12 @@ const withTmp = <A, E, R>(f: (directory: string) => Effect.Effect<A, E, R>) =>
     Effect.promise(() => tmpdir()),
     (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
   ).pipe(Effect.flatMap((tmp) => f(tmp.path)))
+
+const withTwoTmp = <A, E, R>(f: (location: string, outside: string) => Effect.Effect<A, E, R>) =>
+  Effect.acquireRelease(
+    Effect.all([Effect.promise(() => tmpdir()), Effect.promise(() => tmpdir())]),
+    (tmps) => Effect.all(tmps.map((tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()))),
+  ).pipe(Effect.flatMap(([location, outside]) => f(location.path, outside.path)))
 
 describe("FileSystem", () => {
   it.live("reads text and binary files", () =>
@@ -56,13 +62,30 @@ describe("FileSystem", () => {
     ),
   )
 
-  it.live("rejects lexical escapes", () =>
+  it.live("rejects lexical escapes with a typed error, not a defect", () =>
     withTmp((directory) =>
       Effect.gen(function* () {
-        const result = yield* (yield* FileSystem.Service)
+        const error = yield* (yield* FileSystem.Service)
           .read({ path: RelativePath.make("../outside.txt") })
-          .pipe(Effect.exit)
-        expect(Exit.isFailure(result)).toBe(true)
+          .pipe(Effect.flip)
+        expect(error).toBeInstanceOf(FileSystem.PathEscapeError)
+        expect(error._tag).toBe("FileSystem.PathEscapeError")
+      }).pipe(provide(directory)),
+    ),
+  )
+
+  it.live("rejects symlinks that resolve outside the location with a typed error", () =>
+    withTwoTmp((directory, outside) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() => fs.writeFile(path.join(outside, "secret.txt"), "secret"))
+        yield* Effect.promise(() =>
+          fs.symlink(outside, path.join(directory, "link"), process.platform === "win32" ? "junction" : "dir"),
+        )
+        const error = yield* (yield* FileSystem.Service)
+          .read({ path: RelativePath.make(path.join("link", "secret.txt")) })
+          .pipe(Effect.flip)
+        expect(error).toBeInstanceOf(FileSystem.PathEscapeError)
+        expect(error._tag).toBe("FileSystem.PathEscapeError")
       }).pipe(provide(directory)),
     ),
   )

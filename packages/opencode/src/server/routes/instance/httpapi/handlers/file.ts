@@ -79,7 +79,11 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
             .readFileString(path.join(location.project.directory, ".ignore"))
             .pipe(Effect.catch(() => Effect.succeed("")))
           if (ignorefile) ignored.add(ignorefile)
-          return (yield* fs.list({ path: RelativePath.make(ctx.query.path) })).map((item) => ({
+          return (yield* fs.list({ path: RelativePath.make(ctx.query.path) }).pipe(
+            // Legacy surface keeps the historical defect behavior for path escapes; the
+            // canonical v2 route returns a typed 403 instead.
+            Effect.catchTag("FileSystem.PathEscapeError", (error) => Effect.die(new Error(error.message))),
+          )).map((item) => ({
             name: path.basename(item.path),
             path: item.path,
             absolute: path.resolve(location.directory, item.path),
@@ -101,6 +105,9 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
       return yield* filesystem(
         FileSystem.Service.use((fs) => fs.read({ path: RelativePath.make(ctx.query.path) })),
       ).pipe(
+        // Legacy surface keeps the historical defect behavior for path escapes; the
+        // canonical v2 route returns a typed 403 instead.
+        Effect.catchTag("FileSystem.PathEscapeError", (error) => Effect.die(new Error(error.message))),
         Effect.flatMap((item) =>
           Effect.gen(function* () {
             const text = item.content.includes(0)

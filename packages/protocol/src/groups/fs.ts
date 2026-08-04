@@ -3,6 +3,7 @@ import { Location } from "@opencode-ai/schema/location"
 import { PositiveInt, RelativePath } from "@opencode-ai/schema/schema"
 import { Schema } from "effect"
 import { HttpApiEndpoint, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/unstable/httpapi"
+import { PathEscapeError } from "../errors"
 import { LocationQuery, locationQueryOpenApi } from "./location"
 
 const ListQuery = Schema.Struct({
@@ -22,6 +23,7 @@ export const FileSystemGroup = HttpApiGroup.make("server.fs")
     HttpApiEndpoint.get("fs.read", "/api/fs/read/*", {
       query: LocationQuery,
       success: Schema.Uint8Array.pipe(HttpApiSchema.asUint8Array()),
+      error: PathEscapeError,
     })
       .annotateMerge(locationQueryOpenApi)
       .annotateMerge(
@@ -36,6 +38,7 @@ export const FileSystemGroup = HttpApiGroup.make("server.fs")
     HttpApiEndpoint.get("fs.list", "/api/fs/list", {
       query: ListQuery,
       success: Location.response(Schema.Array(FileSystem.Entry)),
+      error: PathEscapeError,
     })
       .annotateMerge(locationQueryOpenApi)
       .annotateMerge(
