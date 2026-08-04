@@ -271,6 +271,14 @@ describe("tool parameters", () => {
         format: "markdown",
       })
     })
+
+    test("rejects timeout values outside the allowed 1..120 second range", () => {
+      expect(accepts(WebFetch, { url: "https://example.com", timeout: 0 })).toBe(false)
+      expect(accepts(WebFetch, { url: "https://example.com", timeout: -5 })).toBe(false)
+      expect(accepts(WebFetch, { url: "https://example.com", timeout: 121 })).toBe(false)
+      expect(accepts(WebFetch, { url: "https://example.com", timeout: 1 })).toBe(true)
+      expect(accepts(WebFetch, { url: "https://example.com", timeout: 120 })).toBe(true)
+    })
   })
 
   describe("websearch", () => {

@@ -1,7 +1,7 @@
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
-import { Effect, Layer } from "effect"
+import { Cause, Effect, Exit, Layer } from "effect"
 import { FetchHttpClient, HttpClient } from "effect/unstable/http"
 import { Agent } from "../../src/agent/agent"
 import { Truncate } from "@/tool/truncate"
@@ -42,6 +42,15 @@ const exec = Effect.fn("WebFetchToolTest.exec")(function* (args: Tool.InferParam
   const tool = yield* info.init()
   return yield* tool.execute(args, ctx)
 })
+
+// The tool wrapper ends with Effect.orDie, so failures surface as die reasons;
+// recover the message from the defect to assert the reason for a blocked URL.
+function dieMessage(exit: Exit.Exit<unknown, unknown>) {
+  if (!Exit.isFailure(exit)) return ""
+  const die = exit.cause.reasons.find(Cause.isDieReason)
+  const defect = die?.defect
+  return defect instanceof Error ? defect.message : String(defect)
+}
 
 describe("tool.webfetch", () => {
   it.instance("returns image responses as file attachments", () =>
@@ -113,6 +122,87 @@ describe("tool.webfetch", () => {
           const result = yield* exec({ url: new URL("/page.html", url).toString(), format: "text" })
           expect(result.output).toBe("Hello world")
           expect(result.attachments).toBeUndefined()
+        }),
+    ),
+  )
+
+  it.instance("rejects timeout values below the minimum with a typed error", () =>
+    Effect.gen(function* () {
+      const exit = yield* exec({ url: "https://example.com", format: "text", timeout: 0 }).pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) return
+      const die = exit.cause.reasons.find(Cause.isDieReason)
+      expect(die?.defect).toBeInstanceOf(Tool.InvalidArgumentsError)
+    }),
+  )
+
+  it.instance("rejects negative timeout values with a typed error", () =>
+    Effect.gen(function* () {
+      const exit = yield* exec({ url: "https://example.com", format: "text", timeout: -5 }).pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) return
+      const die = exit.cause.reasons.find(Cause.isDieReason)
+      expect(die?.defect).toBeInstanceOf(Tool.InvalidArgumentsError)
+    }),
+  )
+
+  it.instance("blocks cloud metadata addresses", () =>
+    Effect.gen(function* () {
+      const exit = yield* exec({ url: "http://169.254.169.254/latest/meta-data", format: "text" }).pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) return
+      expect(dieMessage(exit)).toContain("blocked")
+      expect(dieMessage(exit)).toContain("link-local or cloud metadata")
+    }),
+  )
+
+  it.instance("blocks the Alibaba cloud metadata address", () =>
+    Effect.gen(function* () {
+      const exit = yield* exec({ url: "http://100.100.100.200/latest/meta-data", format: "text" }).pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) return
+      expect(dieMessage(exit)).toContain("blocked")
+      expect(dieMessage(exit)).toContain("link-local or cloud metadata")
+    }),
+  )
+
+  it.instance("blocks private addresses by default", () =>
+    Effect.gen(function* () {
+      const exit = yield* exec({ url: "http://127.0.0.1:8080/", format: "text" }).pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) return
+      expect(dieMessage(exit)).toContain("blocked")
+      expect(dieMessage(exit)).toContain("private network address")
+    }),
+  )
+
+  it.instance("blocks IPv4-mapped private addresses", () =>
+    Effect.gen(function* () {
+      const exit = yield* exec({ url: "http://[::ffff:7f00:1]:8080/", format: "text" }).pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) return
+      expect(dieMessage(exit)).toContain("private network address")
+    }),
+  )
+
+  it.instance("allows non-blocked hostnames", () =>
+    withFetch(
+      () => new Response("hello", { status: 200, headers: { "content-type": "text/plain" } }),
+      (url) =>
+        Effect.gen(function* () {
+          const result = yield* exec({ url: new URL("/allowed", url).toString(), format: "text" })
+          expect(result.output).toBe("hello")
+        }),
+    ),
+  )
+
+  it.instance("accepts the maximum timeout", () =>
+    withFetch(
+      () => new Response("ok", { status: 200, headers: { "content-type": "text/plain" } }),
+      (url) =>
+        Effect.gen(function* () {
+          const result = yield* exec({ url: new URL("/slow", url).toString(), format: "text", timeout: 120 })
+          expect(result.output).toBe("ok")
         }),
     ),
   )

@@ -18,7 +18,9 @@ export const Parameters = Schema.Struct({
       default: "markdown",
     })
     .pipe(Schema.withDecodingDefault(Effect.succeed("markdown" as const))),
-  timeout: Schema.optional(Schema.Number).annotate({ description: "Optional timeout in seconds (max 120)" }),
+  timeout: Schema.optional(
+    Schema.Number.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(120)),
+  ).annotate({ description: "Optional timeout in seconds (min 1, max 120)" }),
 })
 
 export const WebFetchTool = Tool.define(
@@ -34,6 +36,11 @@ export const WebFetchTool = Tool.define(
         Effect.gen(function* () {
           if (!params.url.startsWith("http://") && !params.url.startsWith("https://")) {
             throw new Error("URL must start with http:// or https://")
+          }
+
+          const blocked = blockedUrlReason(new URL(params.url))
+          if (blocked) {
+            throw new Error(`URL is blocked by webfetch SSRF protection (${blocked})`)
           }
 
           yield* ctx.ask({
@@ -189,4 +196,86 @@ function convertHTMLToMarkdown(html: string): string {
   })
   turndownService.remove(["script", "style", "meta", "link"])
   return turndownService.turndown(html)
+}
+
+// --- SSRF protection -----------------------------------------------------
+// webfetch is a network-facing tool, so refuse high-risk targets before any
+// request is made. Link-local and cloud metadata addresses are always blocked:
+// there is no legitimate coding-agent use case for fetching them, and they are
+// the primary SSRF pivots (169.254.169.254, 100.100.100.200, 169.254.0.0/16,
+// fe80::/10, ::1, plus IPv4-mapped IPv6 forms).
+//
+// Private ranges (loopback 127.0.0.0/8, RFC1918, IPv6 ULA) are also blocked by
+// default to keep the tool from reaching internal networks. This is
+// deliberately stricter than relying on the permission ask alone:
+// private-address fetches would otherwise be one approval away from internal
+// services. Local development against hostnames like `localhost` is
+// unaffected — only raw private-address literals are refused.
+
+function blockedUrlReason(url: URL): string | undefined {
+  const host = normalizeHostname(url.hostname)
+  const ipv4 = host.includes(":") ? ipv4FromMapped(host) : host
+  if (ipv4 && isIpv4Literal(ipv4)) {
+    if (isLinkLocalOrMetadataIpv4(ipv4)) return "link-local or cloud metadata address"
+    if (isPrivateIpv4(ipv4)) return "private network address"
+    return undefined
+  }
+  if (host.includes(":")) {
+    if (host === "::1" || isLinkLocalIpv6(host)) return "loopback or link-local address"
+    if (isUlaIpv6(host)) return "private network address"
+  }
+  return undefined
+}
+
+function normalizeHostname(hostname: string) {
+  return hostname.toLowerCase().replace(/\.$/, "").replace(/^\[|\]$/g, "")
+}
+
+function isIpv4Literal(value: string | undefined) {
+  if (!value) return false
+  const parts = value.split(".")
+  return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part))
+}
+
+function isLinkLocalOrMetadataIpv4(ipv4: string) {
+  const [a, b] = ipv4.split(".").map(Number)
+  // 169.254.0.0/16 link-local, which covers cloud metadata 169.254.169.254
+  if (a === 169 && b === 254) return true
+  // Alibaba Cloud metadata endpoint
+  return ipv4 === "100.100.100.200"
+}
+
+function isPrivateIpv4(ipv4: string) {
+  const [a, b] = ipv4.split(".").map(Number)
+  // 127.0.0.0/8 loopback and 10.0.0.0/8
+  if (a === 127 || a === 10) return true
+  // 172.16.0.0/12
+  if (a === 172 && b >= 16 && b <= 31) return true
+  // 192.168.0.0/16
+  return a === 192 && b === 168
+}
+
+function isLinkLocalIpv6(host: string) {
+  // fe80::/10
+  return /^fe[89ab]/.test(host)
+}
+
+function isUlaIpv6(host: string) {
+  // fc00::/7, which also covers the AWS IPv6 metadata endpoint fd00:ec2::254
+  return /^f[cd]/.test(host)
+}
+
+// Parse an IPv4-mapped IPv6 literal like `::ffff:7f00:1` back to its IPv4 form.
+function ipv4FromMapped(host: string) {
+  const mapped = /^::ffff:(.+)$/.exec(host)
+  if (!mapped) return undefined
+  const tail = mapped[1]
+  if (tail === undefined) return undefined
+  if (isIpv4Literal(tail)) return tail
+  const [hi, lo] = tail.split(":")
+  if (hi === undefined || lo === undefined) return undefined
+  const a = parseInt(hi, 16)
+  const b = parseInt(lo, 16)
+  if (Number.isNaN(a) || Number.isNaN(b)) return undefined
+  return `${(a >> 8) & 0xff}.${a & 0xff}.${(b >> 8) & 0xff}.${b & 0xff}`
 }
