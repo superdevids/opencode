@@ -600,6 +600,25 @@ export function latest(msgs: WithParts[]) {
   return { user, assistant, finished, tasks }
 }
 
+// JSON.stringify can return undefined (for `undefined` input) or throw (for
+// circular structures). The UnknownError message field is Schema.String, so
+// the error handler must always produce a string without crashing.
+function safeStringify(e: unknown): string {
+  try {
+    const serialized = JSON.stringify(e)
+    if (serialized !== undefined) return serialized
+  } catch {
+    // Circular references make JSON.stringify throw — fall back to a safe
+    // description below instead of crashing the error handler.
+  }
+  if (typeof e === "string") return e
+  if (e instanceof Error) return errorMessage(e)
+  if (typeof e === "object" && e !== null && "message" in e && typeof e.message === "string" && e.message) {
+    return e.message
+  }
+  return String(e)
+}
+
 export function fromError(
   e: unknown,
   ctx: { providerID: ProviderV2.ID; aborted?: boolean },
@@ -725,8 +744,12 @@ export function fromError(
             },
           ).toObject()
         }
-      } catch {}
-      return new NamedError.Unknown({ message: JSON.stringify(e) }, { cause: e }).toObject()
+      } catch {
+        // parseStreamError stringifies untrusted input internally, so a
+        // circular body can throw here. Swallow the secondary failure — the
+        // safe serialization below still produces a valid UnknownError.
+      }
+      return new NamedError.Unknown({ message: safeStringify(e) }, { cause: e }).toObject()
   }
 }
 

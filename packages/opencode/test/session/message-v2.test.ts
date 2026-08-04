@@ -1515,6 +1515,40 @@ describe("session.message-v2.fromError", () => {
     })
   })
 
+  test("serializes undefined throws with a valid string message", () => {
+    const result = MessageV2.fromError(undefined, { providerID })
+
+    expect(result).toStrictEqual({
+      name: "UnknownError",
+      data: {
+        message: "undefined",
+      },
+    })
+  })
+
+  test("serializes circular structures without throwing", () => {
+    const circular: Record<string, unknown> = { name: "loop" }
+    circular.self = circular
+
+    const result = MessageV2.fromError(circular, { providerID })
+
+    expect(result.name).toBe("UnknownError")
+    const message = (result.data as { message?: string }).message
+    expect(typeof message).toBe("string")
+    expect(message?.length).toBeGreaterThan(0)
+  })
+
+  test("preserves the message of a plain Error", () => {
+    const result = MessageV2.fromError(new Error("boom"), { providerID })
+
+    expect(result).toStrictEqual({
+      name: "UnknownError",
+      data: {
+        message: "boom",
+      },
+    })
+  })
+
   test("serializes tagged errors with their message", () => {
     const result = MessageV2.fromError(new Question.RejectedError(), { providerID })
 
