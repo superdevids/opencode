@@ -860,7 +860,14 @@ const layer = Layer.effect(
       cwd = repository.worktree,
     ) {
       const result = yield* proc
-        .run(ChildProcess.make("git", args, { cwd, extendEnv: true, stdin: "ignore" }))
+        .run(
+          ChildProcess.make("git", args, {
+            cwd,
+            extendEnv: true,
+            stdin: "ignore",
+            env: { LC_ALL: "C", LC_MESSAGES: "C" },
+          }),
+        )
         .pipe(
           Effect.mapError(
             (cause) => new WorktreeError({ operation, directory: worktreeDirectory, message: cause.message, cause }),
@@ -872,7 +879,7 @@ const layer = Layer.effect(
         operation,
         directory: worktreeDirectory,
         message,
-        forceRequired: operation === "remove" && /contains modified or untracked files|is dirty/i.test(message),
+        forceRequired: operation === "remove" && isRemoveForceRequired(message),
       })
     })
 
@@ -954,6 +961,12 @@ interface Result {
 function run(cwd: string, proc: AppProcess.Interface) {
   return (args: string[]) =>
     execute(cwd, proc)(args).pipe(Effect.catch(() => Effect.succeed({ exitCode: 1, text: "", stderr: "" })))
+}
+
+// Git localizes its error messages, so detect "needs --force" from the flag
+// suggestion that appears in every locale rather than English-only wording.
+function isRemoveForceRequired(message: string) {
+  return /contains modified or untracked files|is dirty|--force/i.test(message)
 }
 
 function execute(cwd: string, proc: AppProcess.Interface) {

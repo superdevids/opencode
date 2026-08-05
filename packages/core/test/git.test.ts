@@ -2,14 +2,17 @@ import { describe, expect } from "bun:test"
 import { $ } from "bun"
 import fs from "fs/promises"
 import path from "path"
-import { Effect } from "effect"
+import { Effect, Layer, Stream } from "effect"
+import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Git } from "@opencode-ai/core/git"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { AbsolutePath, RelativePath } from "@opencode-ai/core/schema"
 import { branch, commit, gitRemote } from "./fixture/git"
 import { tmpdir } from "./fixture/tmpdir"
 import { testEffect } from "./lib/effect"
 
+const encoder = new TextEncoder()
 const it = testEffect(LayerNode.compile(Git.node))
 
 describe("Git", () => {
@@ -79,6 +82,37 @@ async function initRepo(directory: string) {
   await $`git commit --allow-empty -m root`.cwd(directory).quiet()
 }
 
+function mockWorktreeRemove(stderr: string, onCommand?: (command: ChildProcess.StandardCommand) => void) {
+  return Layer.effect(
+    ChildProcessSpawner.ChildProcessSpawner,
+    Effect.gen(function* () {
+      const real = yield* ChildProcessSpawner.ChildProcessSpawner
+      return ChildProcessSpawner.make(
+        Effect.fnUntraced(function* (command) {
+          const std = ChildProcess.isStandardCommand(command) ? command : undefined
+          if (std?.command === "git" && std.args[0] === "worktree" && std.args[1] === "remove") {
+            onCommand?.(std)
+            return ChildProcessSpawner.makeHandle({
+              pid: ChildProcessSpawner.ProcessId(0),
+              exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(128)),
+              isRunning: Effect.succeed(false),
+              kill: () => Effect.void,
+              stdin: { [Symbol.for("effect/Sink/TypeId")]: Symbol.for("effect/Sink/TypeId") } as any,
+              stdout: Stream.empty,
+              stderr: Stream.make(encoder.encode(stderr)),
+              all: Stream.empty,
+              getInputFd: () => ({ [Symbol.for("effect/Sink/TypeId")]: Symbol.for("effect/Sink/TypeId") }) as any,
+              getOutputFd: () => Stream.empty,
+              unref: Effect.succeed(Effect.void),
+            })
+          }
+          return yield* real.spawn(command)
+        }),
+      )
+    }),
+  ).pipe(Layer.provide(LayerNode.compile(CrossSpawnSpawner.node)))
+}
+
 describe("Git worktrees", () => {
   it.live("creates, lists, and removes linked worktrees", () =>
     Effect.gen(function* () {
@@ -106,6 +140,42 @@ describe("Git worktrees", () => {
       if (!linked) throw new Error("Linked worktree not found")
       yield* git.worktree.remove({ repository: linked, directory: worktree, force: false })
       expect((yield* git.worktree.list(repo)).some((entry) => entry.directory.endsWith("-git-worktree"))).toBe(false)
+    }),
+  )
+})
+
+describe("Git worktree remove force detection", () => {
+  let capturedEnv: ChildProcess.CommandOptions["env"] | undefined
+  // git localizes stderr; simulate a non-English git that still suggests --force
+  const localizedDirtyStderr = "fatal: 'C:\\tmp\\linked' 包含已修改或未跟踪的文件，使用 --force 删除它"
+
+  const fx = testEffect(
+    LayerNode.compile(Git.node, [
+      [
+        CrossSpawnSpawner.node,
+        mockWorktreeRemove(localizedDirtyStderr, (command) => (capturedEnv = command.options.env)),
+      ],
+    ]),
+  )
+
+  fx.live("flags forceRequired on localized git stderr", () =>
+    Effect.gen(function* () {
+      const git = yield* Git.Service
+      const directory = AbsolutePath.make("C:\\tmp\\linked")
+      const repository = new Git.Repository({
+        worktree: directory,
+        gitDirectory: AbsolutePath.make("C:\\tmp\\.git"),
+        commonDirectory: AbsolutePath.make("C:\\tmp\\.git"),
+      })
+
+      const error = yield* git.worktree.remove({ repository, directory, force: false }).pipe(Effect.flip)
+
+      expect(error).toBeInstanceOf(Git.WorktreeError)
+      if (error instanceof Git.WorktreeError) {
+        expect(error.operation).toBe("remove")
+        expect(error.forceRequired).toBe(true)
+      }
+      expect(capturedEnv).toMatchObject({ LC_ALL: "C", LC_MESSAGES: "C" })
     }),
   )
 })
