@@ -23,6 +23,22 @@ export interface LanguageEvent {
   language?: LanguageModelV3
 }
 
+// Default per-chunk SSE timeout (ms) applied when a provider/model does not
+// configure `chunkTimeout`. A silent TCP drop (no FIN/RST) otherwise leaves the
+// stream pending forever and the TUI stuck. Per-chunk semantics keep long
+// reasoning safe as long as deltas keep flowing.
+export const DEFAULT_CHUNK_TIMEOUT = 60_000
+
+// Resolves the effective per-chunk SSE timeout from provider/model options.
+// An explicit positive number wins, `false`/non-positive disables it (same as
+// the previous opt-in behavior), and anything else falls back to
+// DEFAULT_CHUNK_TIMEOUT so silent drops surface as errors instead of hangs.
+export const chunkTimeoutMs = (value: unknown) => {
+  if (value === false) return 0
+  if (typeof value === "number") return value > 0 ? value : 0
+  return DEFAULT_CHUNK_TIMEOUT
+}
+
 function wrapSSE(res: Response, ms: number, ctl: AbortController) {
   if (typeof ms !== "number" || ms <= 0) return res
   if (!res.body) return res
@@ -80,7 +96,7 @@ function prepareOptions(model: ModelV2.Info, pkg: string) {
   if (model.api.type === "aisdk" && model.api.url) options.baseURL = model.api.url
 
   const customFetch = options.fetch
-  const chunkTimeout = options.chunkTimeout
+  const chunkTimeout = chunkTimeoutMs(options.chunkTimeout)
   delete options.chunkTimeout
   options.fetch = async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
     const opts = { ...(init ?? {}) }
