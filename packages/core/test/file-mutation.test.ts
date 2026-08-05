@@ -314,6 +314,99 @@ describe("FileMutation", () => {
     ),
   )
 
+  it.live("commits a BOM-preserving conditional text write when the target is unchanged", () =>
+    withTmp((directory) =>
+      Effect.gen(function* () {
+        const targetPath = path.join(directory, "shared.txt")
+        yield* Effect.promise(() => fs.writeFile(targetPath, "initial"))
+        const target = yield* (yield* LocationMutation.Service).resolve({ path: "shared.txt" })
+
+        expect(
+          yield* (yield* FileMutation.Service).writeTextIfUnchanged({
+            target,
+            expected: new TextEncoder().encode("initial"),
+            content: "\uFEFFafter",
+          }),
+        ).toMatchObject({ operation: "write", target: target.canonical, existed: true })
+        expect(yield* Effect.promise(() => fs.readFile(targetPath, "utf8"))).toBe("\uFEFFafter")
+      }).pipe(provide(directory)),
+    ),
+  )
+
+  it.live("rejects a BOM-preserving conditional text write when the target is stale", () =>
+    withTmp((directory) =>
+      Effect.gen(function* () {
+        const targetPath = path.join(directory, "stale.txt")
+        yield* Effect.promise(() => fs.writeFile(targetPath, "current"))
+        const target = yield* (yield* LocationMutation.Service).resolve({ path: "stale.txt" })
+
+        expect(
+          yield* (yield* FileMutation.Service)
+            .writeTextIfUnchanged({ target, expected: new TextEncoder().encode("older"), content: "replacement" })
+            .pipe(Effect.flip),
+        ).toMatchObject({ _tag: "FileMutation.StaleContentError", path: target.canonical })
+        expect(yield* Effect.promise(() => fs.readFile(targetPath, "utf8"))).toBe("current")
+      }).pipe(provide(directory)),
+    ),
+  )
+
+  it.live("creates a missing target with a BOM-preserving conditional text write", () =>
+    withTmp((directory) =>
+      Effect.gen(function* () {
+        const target = yield* (yield* LocationMutation.Service).resolve({ path: "created.txt" })
+
+        expect(
+          yield* (yield* FileMutation.Service).writeTextIfUnchanged({
+            target,
+            expected: new Uint8Array(),
+            content: "\uFEFF\uFEFF\uFEFFcreated",
+          }),
+        ).toMatchObject({ operation: "write", target: target.canonical, existed: false })
+        expect(yield* Effect.promise(() => fs.readFile(target.canonical, "utf8"))).toBe("\uFEFFcreated")
+      }).pipe(provide(directory)),
+    ),
+  )
+
+  it.live("allows only one concurrent BOM-preserving conditional write based on the same bytes", () =>
+    withTmp((directory) =>
+      Effect.gen(function* () {
+        const targetPath = path.join(directory, "shared.txt")
+        yield* Effect.promise(() => fs.writeFile(targetPath, "initial"))
+        const firstStarted = yield* Deferred.make<void>()
+        const releaseFirst = yield* Deferred.make<void>()
+        let writes = 0
+        const filesystem = instrumentWrites((write) =>
+          Effect.gen(function* () {
+            writes++
+            if (writes === 1) {
+              yield* Deferred.succeed(firstStarted, undefined)
+              yield* Deferred.await(releaseFirst)
+            }
+            yield* write
+          }),
+        )
+
+        yield* Effect.gen(function* () {
+          const mutation = yield* LocationMutation.Service
+          const files = yield* FileMutation.Service
+          const target = yield* mutation.resolve({ path: "shared.txt" })
+          const expected = new TextEncoder().encode("initial")
+          const first = yield* files.writeTextIfUnchanged({ target, expected, content: "first" }).pipe(Effect.forkChild)
+          yield* Deferred.await(firstStarted)
+          const second = yield* files
+            .writeTextIfUnchanged({ target, expected, content: "second" })
+            .pipe(Effect.flip, Effect.forkChild)
+
+          yield* Deferred.succeed(releaseFirst, undefined)
+          yield* Fiber.join(first)
+          expect(yield* Fiber.join(second)).toMatchObject({ _tag: "FileMutation.StaleContentError" })
+          expect(yield* Effect.promise(() => fs.readFile(targetPath, "utf8"))).toBe("first")
+          expect(writes).toBe(1)
+        }).pipe(provide(directory, filesystem))
+      }),
+    ),
+  )
+
   it.live("allows distinct canonical targets to proceed independently", () =>
     withTmp((directory) =>
       Effect.gen(function* () {

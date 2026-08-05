@@ -25,6 +25,10 @@ export interface ConditionalWriteInput extends WriteInput {
   readonly expected: Uint8Array
 }
 
+export interface ConditionalTextWriteInput extends TextWriteInput {
+  readonly expected: Uint8Array
+}
+
 export interface RemoveInput {
   readonly target: Target
 }
@@ -60,6 +64,10 @@ export interface Interface {
   /** Commit only if an existing target still has the expected bytes. */
   readonly writeIfUnchanged: (
     input: ConditionalWriteInput,
+  ) => Effect.Effect<WriteResult, StaleContentError | FSUtil.Error>
+  /** Write text while retaining an existing UTF-8 BOM, committing only if an existing target still has the expected bytes. Missing targets are created. */
+  readonly writeTextIfUnchanged: (
+    input: ConditionalTextWriteInput,
   ) => Effect.Effect<WriteResult, StaleContentError | FSUtil.Error>
   readonly remove: (input: RemoveInput) => Effect.Effect<RemoveResult, FSUtil.Error>
 }
@@ -156,6 +164,25 @@ const layer = Layer.effect(
       ),
     )
 
+    const writeTextIfUnchanged = Effect.fn("FileMutation.writeTextIfUnchanged")((input: ConditionalTextWriteInput) =>
+      withTargetLock(input.target)(
+        Effect.gen(function* () {
+          const next = splitBom(input.content)
+          const current = yield* fs
+            .readFile(input.target.canonical)
+            .pipe(Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(undefined)))
+          if (current && !sameBytes(current, input.expected)) {
+            return yield* new StaleContentError({ path: input.target.canonical })
+          }
+          yield* fs.writeWithDirs(
+            input.target.canonical,
+            joinBom(next.text, Boolean(current && hasUtf8Bom(current)) || next.bom),
+          )
+          return writeResult(input.target, current !== undefined)
+        }),
+      ),
+    )
+
     const remove = Effect.fn("FileMutation.remove")((input: RemoveInput) =>
       withTargetLock(input.target)(
         Effect.gen(function* () {
@@ -168,7 +195,7 @@ const layer = Layer.effect(
       ),
     )
 
-    return Service.of({ create, write, writeTextPreservingBom, writeIfUnchanged, remove })
+    return Service.of({ create, write, writeTextPreservingBom, writeIfUnchanged, writeTextIfUnchanged, remove })
   }),
 )
 

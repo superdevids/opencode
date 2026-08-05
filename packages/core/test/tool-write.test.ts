@@ -24,6 +24,7 @@ const sessionID = SessionV2.ID.make("ses_write_tool_test")
 const assertions: PermissionV2.AssertInput[] = []
 const writes: string[] = []
 let denyAction: string | undefined
+let staleReads = 0
 
 const permission = Layer.succeed(
   PermissionV2.Service,
@@ -46,6 +47,7 @@ const reset = () => {
   assertions.length = 0
   writes.length = 0
   denyAction = undefined
+  staleReads = 0
 }
 
 const filesystem = Layer.effect(
@@ -60,7 +62,31 @@ const filesystem = Layer.effect(
   }),
 ).pipe(Layer.provide(LayerNode.compile(FSUtil.node)))
 
-const withTool = <A, E, R>(directory: string, body: (registry: ToolRegistry.Interface) => Effect.Effect<A, E, R>) => {
+// Simulates the file changing after the write tool snapshots it: the first
+// read returns a stale baseline, the conditional re-read returns current bytes.
+const staleReadFilesystem = Layer.effect(
+  FSUtil.Service,
+  Effect.gen(function* () {
+    const fs = yield* FSUtil.Service
+    return FSUtil.Service.of({
+      ...fs,
+      readFile: (target) =>
+        Effect.sync(() => ++staleReads).pipe(
+          Effect.andThen((count) =>
+            count === 1 ? Effect.succeed(new TextEncoder().encode("older")) : fs.readFile(target),
+          ),
+        ),
+      writeWithDirs: (target, content, mode) =>
+        Effect.sync(() => writes.push(target)).pipe(Effect.andThen(fs.writeWithDirs(target, content, mode))),
+    })
+  }),
+).pipe(Layer.provide(LayerNode.compile(FSUtil.node)))
+
+const withTool = <A, E, R>(
+  directory: string,
+  body: (registry: ToolRegistry.Interface) => Effect.Effect<A, E, R>,
+  filesystemLayer = filesystem,
+) => {
   const activeLocation = Layer.succeed(
     Location.Service,
     Location.Service.of(location({ directory: AbsolutePath.make(directory) })),
@@ -78,7 +104,7 @@ const withTool = <A, E, R>(directory: string, body: (registry: ToolRegistry.Inte
           WriteTool.node,
         ]),
         [
-          [FSUtil.node, filesystem],
+          [FSUtil.node, filesystemLayer],
           [Location.node, activeLocation],
           [PermissionV2.node, permission],
           [ToolOutputStore.node, ToolOutputStore.nodeWithoutConfig],
@@ -278,6 +304,36 @@ describe("WriteTool", () => {
         Effect.promise(() =>
           Promise.all([active[Symbol.asyncDispose](), outside[Symbol.asyncDispose]()]).then(() => undefined),
         ),
+    ),
+  )
+
+  it.live("rejects a write when the file changes after the baseline read", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        const target = path.join(tmp.path, "stale.txt")
+        return Effect.promise(() => fs.writeFile(target, "current")).pipe(
+          Effect.andThen(
+            withTool(
+              tmp.path,
+              (registry) => executeTool(registry, call({ path: "stale.txt", content: "replacement" })),
+              staleReadFilesystem,
+            ),
+          ),
+          Effect.andThen((result) =>
+            Effect.gen(function* () {
+              expect(result).toEqual({
+                type: "error",
+                value: "File changed after permission approval. Read it again before writing.",
+              })
+              expect(yield* Effect.promise(() => fs.readFile(target, "utf8"))).toBe("current")
+              expect(writes).toEqual([])
+            }),
+          ),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
     ),
   )
 })
