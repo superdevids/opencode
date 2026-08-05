@@ -4,7 +4,7 @@ import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
-import { Cause, Config, Effect, Exit, Layer } from "effect"
+import { Cause, Config, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse, HttpRouter, HttpServer } from "effect/unstable/http"
 import { layerWebSocketConstructorGlobal } from "effect/unstable/socket/Socket"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -24,6 +24,7 @@ import * as HttpSessionError from "../../src/server/routes/instance/httpapi/hand
 import { ExperimentalPaths } from "../../src/server/routes/instance/httpapi/groups/experimental"
 import { SessionPaths } from "../../src/server/routes/instance/httpapi/groups/session"
 import { Session } from "@/session/session"
+import { SessionRunState } from "@/session/run-state"
 import { MessageID, PartID, SessionID, type SessionID as SessionIDType } from "../../src/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
@@ -44,7 +45,15 @@ const noopBootstrapLayer = Layer.succeed(
   InstanceBootstrapService.Service.of({ run: Effect.void }),
 )
 const appLayer = AppNodeBuilder.build(
-  LayerNode.group([InstanceStore.node, Project.node, Session.node, Workspace.node, Database.node, Ripgrep.node]),
+  LayerNode.group([
+    InstanceStore.node,
+    Project.node,
+    Session.node,
+    SessionRunState.node,
+    Workspace.node,
+    Database.node,
+    Ripgrep.node,
+  ]),
   [[InstanceStore.bootstrapNode, noopBootstrapLayer]],
 )
 const servedRoutes: Layer.Layer<never, Config.ConfigError, HttpServer.HttpServer> = HttpRouter.serve(
@@ -88,6 +97,27 @@ function createTextMessage(sessionID: SessionIDType, text: string) {
       text,
     })
     return { info, part }
+  })
+}
+
+function createInFlightAssistantMessage(sessionID: SessionIDType, parentID: MessageID) {
+  return Effect.gen(function* () {
+    const svc = yield* Session.Service
+    const info = yield* svc.updateMessage({
+      id: MessageID.ascending(),
+      role: "assistant",
+      sessionID,
+      parentID,
+      mode: "build",
+      agent: "build",
+      path: { cwd: "/tmp", root: "/tmp" },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ModelV2.ID.make("test"),
+      providerID: ProviderV2.ID.make("test"),
+      time: { created: Date.now() },
+    })
+    return info
   })
 }
 
@@ -1013,6 +1043,56 @@ describe("session HttpApi", () => {
             { method: "DELETE", headers },
           ),
         ).toBe(true)
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
+    "allows deleting a queued user message while the session is busy",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const headers = { "x-opencode-directory": test.directory }
+        const session = yield* createSession({ title: "queued delete" })
+        const parent = yield* createTextMessage(session.id, "parent")
+        const assistant = yield* createInFlightAssistantMessage(session.id, parent.info.id)
+        const queued = yield* createTextMessage(session.id, "queued prompt")
+
+        // Make the session busy with a runner that never completes on its own.
+        const runState = yield* SessionRunState.Service
+        const release = yield* Deferred.make<void>()
+        const busy = yield* runState
+          .ensureRunning(
+            session.id,
+            Effect.succeed({} as SessionV1.WithParts),
+            Deferred.await(release).pipe(Effect.as({} as SessionV1.WithParts)),
+          )
+          .pipe(Effect.forkScoped)
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const exit = yield* runState.assertNotBusy(session.id).pipe(Effect.exit)
+            return Exit.isFailure(exit) ? (true as const) : undefined
+          }),
+          "session never became busy",
+        )
+
+        // A user message queued after the in-flight assistant turn can be cancelled.
+        expect(
+          yield* requestJson<boolean>(
+            pathFor(SessionPaths.deleteMessage, { sessionID: session.id, messageID: queued.info.id }),
+            { method: "DELETE", headers },
+          ),
+        ).toBe(true)
+
+        // Messages that belong to the active turn still refuse deletion while busy.
+        const assistantDelete = yield* request(
+          pathFor(SessionPaths.deleteMessage, { sessionID: session.id, messageID: assistant.id }),
+          { method: "DELETE", headers },
+        )
+        expect(assistantDelete.status).toBe(409)
+
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.await(busy).pipe(Effect.exit)
       }),
     { git: true, config: { formatter: false, lsp: false } },
   )

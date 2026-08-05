@@ -381,7 +381,21 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID; messageID: MessageID }
     }) {
       yield* requireSession(ctx.params.sessionID)
-      yield* SessionError.mapBusy(runState.assertNotBusy(ctx.params.sessionID))
+      // Allow deleting a queued (not yet promoted) user message while the session
+      // is busy so the TUI can cancel a queued prompt. Messages that belong to the
+      // active turn still refuse deletion until the session is idle.
+      const target = yield* session
+        .findMessage(ctx.params.sessionID, (m) => m.info.id === ctx.params.messageID)
+        .pipe(Effect.option, Effect.map(Option.flatten))
+      const inFlight = yield* session
+        .findMessage(ctx.params.sessionID, (m) => m.info.role === "assistant" && !m.info.time.completed)
+        .pipe(Effect.option, Effect.map(Option.flatten))
+      const queued =
+        Option.isSome(target) &&
+        Option.isSome(inFlight) &&
+        target.value.info.role === "user" &&
+        target.value.info.id > inFlight.value.info.id
+      if (!queued) yield* SessionError.mapBusy(runState.assertNotBusy(ctx.params.sessionID))
       yield* session.removeMessage(ctx.params)
       return true
     })

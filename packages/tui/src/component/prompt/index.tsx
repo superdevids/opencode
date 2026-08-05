@@ -37,7 +37,7 @@ import { usePromptStash } from "../../prompt/stash"
 import { DialogStash } from "../dialog-stash"
 import { type AutocompleteRef, Autocomplete } from "./autocomplete"
 import { useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid"
-import type { AssistantMessage, FilePart, UserMessage } from "@opencode-ai/sdk/v2"
+import type { AssistantMessage, FilePart, TextPart, UserMessage } from "@opencode-ai/sdk/v2"
 import { Locale } from "../../util/locale"
 import { errorMessage } from "../../util/error"
 import { formatDuration } from "../../util/format"
@@ -258,6 +258,17 @@ export function Prompt(props: PromptProps) {
     const messages = sync.data.message[props.sessionID]
     if (!messages) return undefined
     return messages.findLast((m): m is UserMessage => m.role === "user")
+  })
+
+  const queuedMessages = createMemo(() => {
+    if (!props.sessionID) return []
+    const messages = sync.data.message[props.sessionID] ?? []
+    const completed = messages.findLast((x) => x.role === "assistant" && x.time.completed)?.id
+    const pending = messages.findLast(
+      (x) => x.role === "assistant" && !x.time.completed && (!completed || x.id > completed),
+    )?.id
+    if (!pending) return []
+    return messages.filter((m): m is UserMessage => m.role === "user" && m.id > pending)
   })
 
   const usage = createMemo(() => {
@@ -874,6 +885,33 @@ export function Prompt(props: PromptProps) {
             if (input.cursorOffset !== 0) {
               if (input.scrollY + input.visualCursor.visualRow === 0) input.cursorOffset = 0
               return false
+            }
+
+            // When the input is empty and a prompt is queued behind an active
+            // turn, ArrowUp cancels the last queued message and restores its
+            // text instead of walking prompt history.
+            const queued = queuedMessages().at(-1)
+            if (input.plainText === "" && queued) {
+              const text = (sync.data.part[queued.id] ?? [])
+                .filter((part): part is TextPart => part.type === "text" && !part.synthetic)
+                .map((part) => part.text)
+                .join("\n\n")
+              void sdk.client.session
+                .deleteMessage({ sessionID: props.sessionID!, messageID: queued.id }, { throwOnError: true })
+                .then(() => {
+                  if (!text) return
+                  input.setText(text)
+                  setStore("prompt", { input: text, parts: [] })
+                  input.cursorOffset = text.length
+                })
+                .catch((error) => {
+                  toast.show({
+                    title: "Failed to cancel queued message",
+                    message: errorMessage(error),
+                    variant: "error",
+                  })
+                })
+              return true
             }
 
             const item = history.move(-1, input.plainText)
