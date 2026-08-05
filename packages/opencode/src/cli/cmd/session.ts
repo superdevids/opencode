@@ -86,7 +86,14 @@ export const SessionListCommand = effectCmd({
   handler: Effect.fn("Cli.session.list")(function* (args) {
     const sessions = yield* Session.Service.use((svc) => svc.list({ roots: true, limit: args.maxCount }))
 
-    if (sessions.length === 0) return
+    if (sessions.length === 0) {
+      if (args.format === "json") {
+        console.log("[]")
+      } else {
+        console.error("No sessions found")
+      }
+      return
+    }
 
     const output = args.format === "json" ? formatSessionJSON(sessions) : formatSessionTable(sessions)
 
