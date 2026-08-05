@@ -84,22 +84,6 @@ export function DialogModel(props: { providerID?: string }) {
               onSelect(provider.id, model)
             },
           })),
-          filter((option) => {
-            if (!showSections) return true
-            if (
-              favorites.some(
-                (item) => item.providerID === option.value.providerID && item.modelID === option.value.modelID,
-              )
-            )
-              return false
-            if (
-              recents.some(
-                (item) => item.providerID === option.value.providerID && item.modelID === option.value.modelID,
-              )
-            )
-              return false
-            return true
-          }),
           (options) => sortModelOptions(options, props.providerID !== undefined),
         ),
       ),
