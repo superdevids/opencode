@@ -278,6 +278,14 @@ export function Session() {
 
   createEffect(() => {
     const sessionID = route.sessionID
+    // Never forward unresolved placeholder session IDs (e.g. "{id}" or the
+    // temporary "dummy" used while --continue resolves) to the server. The
+    // server rejects them with a SessionID schema error and the TUI would keep
+    // rendering a stale session frame, so fall back to the home route instead.
+    if (!sessionID.startsWith("ses")) {
+      navigate({ type: "home" })
+      return
+    }
     void (async () => {
       const previousWorkspace = untrack(() => project.workspace.current())
       const result = await sdk.client.session.get({ sessionID }, { throwOnError: true })
