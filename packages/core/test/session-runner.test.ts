@@ -248,6 +248,7 @@ const execution = Layer.effect(
       resume: coordinator.run,
       wake: coordinator.wake,
       interrupt: coordinator.interrupt,
+      compact: (sessionID) => sessionRunner.compact(sessionID),
     })
   }),
 ).pipe(Layer.provide(runnerLayer))
@@ -1171,6 +1172,84 @@ describe("SessionRunnerLLM", () => {
         { type: "compaction" },
         { type: "assistant", finish: "stop" },
       ])
+    }),
+  )
+
+  it.effect("manually compacts an idle Session into a durable manual checkpoint", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const { db } = yield* Database.Service
+      response = fragmentFixture("text", "text-first", ["Earlier answer"]).completeEvents
+      yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Earlier question ".repeat(400) }),
+        resume: false,
+      })
+      yield* session.resume(sessionID)
+
+      currentModel = compactModel
+      requests.length = 0
+      response = fragmentFixture("text", "text-summary-manual", ["## Objective\n- Preserve the task"]).completeEvents
+      yield* session.compact({ sessionID })
+
+      expect(requests).toHaveLength(1)
+      expect(userTexts(requests[0])[0]).toContain("## Objective")
+      const ended = yield* db
+        .select({ data: EventTable.data })
+        .from(EventTable)
+        .where(eq(EventTable.type, EventV2.versionedType(SessionEvent.Compaction.Ended.type, 1)))
+        .all()
+        .pipe(Effect.orDie)
+      expect(ended).toHaveLength(1)
+      expect(ended[0]?.data).toMatchObject({ reason: "manual", text: "## Objective\n- Preserve the task" })
+      const context = yield* (yield* SessionStore.Service).context(sessionID)
+      expect(context[0]).toMatchObject({
+        type: "compaction",
+        reason: "manual",
+        summary: "## Objective\n- Preserve the task",
+      })
+
+      systemBaseline = "Replacement context"
+      currentModel = model
+      requests.length = 0
+      response = []
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Continue" }), resume: false })
+      yield* session.resume(sessionID)
+      expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([["Replacement context"]])
+      expect(userTexts(requests[0])[0]).toContain("<summary>\n## Objective\n- Preserve the task\n</summary>")
+      yield* replaySessionProjection(sessionID)
+      expect((yield* (yield* SessionStore.Service).context(sessionID))[0]).toMatchObject({
+        type: "compaction",
+        reason: "manual",
+      })
+    }),
+  )
+
+  it.effect("rejects manual compaction while the Session is draining", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "First" }), resume: false })
+      const started = yield* Deferred.make<void>()
+      const gate = yield* Deferred.make<void>()
+      streamStarted = started
+      streamGate = gate
+      response = []
+
+      const run = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      yield* Deferred.await(started)
+
+      expect(
+        yield* session.compact({ sessionID }).pipe(
+          Effect.flip,
+          Effect.map((error) => (error instanceof SessionV2.OperationUnavailableError ? error.operation : "other")),
+        ),
+      ).toBe("compact")
+
+      yield* Deferred.succeed(gate, undefined)
+      streamGate = undefined
+      yield* Fiber.await(run)
     }),
   )
 

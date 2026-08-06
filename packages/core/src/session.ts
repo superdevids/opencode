@@ -416,7 +416,17 @@ const layer = Layer.effect(
       }),
       compact: Effect.fn("V2Session.compact")(function* (input) {
         yield* result.get(input.sessionID)
-        return yield* new OperationUnavailableError({ operation: "compact" })
+        if (yield* execution.active.pipe(Effect.map((active) => active.has(input.sessionID))))
+          return yield* new OperationUnavailableError({ operation: "compact" })
+        yield* execution
+          .compact(input.sessionID)
+          .pipe(
+            Effect.catch((error) =>
+              Effect.logError("Failed to compact Session", error).pipe(
+                Effect.annotateLogs({ sessionID: input.sessionID }),
+              ),
+            ),
+          )
       }),
       wait: Effect.fn("V2Session.wait")(function* (sessionID) {
         yield* result.get(sessionID)
