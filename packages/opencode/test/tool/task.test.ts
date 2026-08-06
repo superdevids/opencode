@@ -255,6 +255,53 @@ describe("tool.task", () => {
     }),
   )
 
+  it.instance(
+    "uses the subagent's configured model override for the child prompt",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let seen: SessionPrompt.PromptInput | undefined
+        const promptOps = stubOps({ text: "done", onPrompt: (input) => (seen = input) })
+
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        expect(result.output).toContain(`state="completed"`)
+        expect(seen?.model).toEqual({
+          modelID: ModelV2.ID.make("override-model"),
+          providerID: ProviderV2.ID.make("test"),
+        })
+        // The parent variant is not inherited when the agent overrides the model.
+        expect(seen?.variant).toBeUndefined()
+      }),
+    {
+      config: {
+        agent: {
+          general: {
+            model: "test/override-model",
+          },
+        },
+      },
+    },
+  )
+
   it.instance("execute asks by default and skips checks when bypassed", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seed()
