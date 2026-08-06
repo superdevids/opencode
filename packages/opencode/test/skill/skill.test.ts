@@ -49,6 +49,12 @@ This skill is loaded from the global home directory.
   )
 }
 
+async function createPluginSkill(homeDir: string, relativeDir: string, content: string) {
+  const skillDir = path.join(homeDir, relativeDir)
+  await fs.mkdir(skillDir, { recursive: true })
+  await Bun.write(path.join(skillDir, "SKILL.md"), content)
+}
+
 const withHome = <A, E, R>(home: string, self: Effect.Effect<A, E, R>) =>
   Effect.acquireUseRelease(
     Effect.sync(() => {
@@ -581,5 +587,165 @@ description: A skill in the .opencode/skills directory.
         }),
       { git: true },
     ),
+  )
+
+  it.live("discovers skills from VS Code agent plugin directories", () =>
+    Effect.gen(function* () {
+      const home = process.env.OPENCODE_TEST_HOME
+      if (!home) throw new Error("OPENCODE_TEST_HOME not set by test preload")
+      const tmp = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir({ git: true })),
+        (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+      )
+
+      yield* Effect.promise(() =>
+        createPluginSkill(
+          home,
+          path.join(".vscode", "agent-plugins", "demo-plugin", "skills", "vscode-plugin-skill"),
+          `---
+name: vscode-plugin-skill
+description: A skill shipped inside a VS Code agent plugin.
+---
+
+# VS Code Plugin Skill
+`,
+        ),
+      )
+
+      yield* Effect.gen(function* () {
+        const skill = yield* Skill.Service
+        const list = (yield* skill.all()).filter((s) => s.location !== "<built-in>")
+        expect(list.length).toBe(1)
+        expect(list[0].name).toBe("vscode-plugin-skill")
+        expect(list[0].description).toBe("A skill shipped inside a VS Code agent plugin.")
+        expect(list[0].location).toContain(path.join(".vscode", "agent-plugins", "demo-plugin", "skills"))
+      })
+        .pipe(
+          Effect.ensuring(Effect.promise(() => fs.rm(path.join(home, ".vscode"), { recursive: true, force: true }))),
+        )
+        .pipe(provideInstance(tmp.path))
+    }),
+  )
+
+  it.live("discovers skills from Claude Code plugin manifests", () =>
+    Effect.gen(function* () {
+      const home = process.env.OPENCODE_TEST_HOME
+      if (!home) throw new Error("OPENCODE_TEST_HOME not set by test preload")
+      const tmp = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir({ git: true })),
+        (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+      )
+
+      const pluginDir = path.join(".claude", "plugins", "cache", "marketplace", "demo-plugin")
+      yield* Effect.promise(() =>
+        createPluginSkill(
+          home,
+          path.join(pluginDir, "skills", "claude-plugin-skill"),
+          `---
+name: claude-plugin-skill
+description: A skill shipped inside a Claude Code plugin.
+---
+
+# Claude Plugin Skill
+`,
+        ),
+      )
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(home, ".claude", "plugins", "installed_plugins.json"),
+          JSON.stringify({
+            "demo-plugin": {
+              name: "demo-plugin",
+              source: "marketplace",
+              path: path.join(home, pluginDir),
+              version: "1.0.0",
+            },
+          }),
+        ),
+      )
+
+      yield* Effect.gen(function* () {
+        const skill = yield* Skill.Service
+        const list = (yield* skill.all()).filter((s) => s.location !== "<built-in>")
+        expect(list.length).toBe(1)
+        expect(list[0].name).toBe("claude-plugin-skill")
+        expect(list[0].description).toBe("A skill shipped inside a Claude Code plugin.")
+        expect(list[0].location).toContain(path.join(".claude", "plugins"))
+      })
+        .pipe(
+          Effect.ensuring(Effect.promise(() => fs.rm(path.join(home, ".claude"), { recursive: true, force: true }))),
+        )
+        .pipe(provideInstance(tmp.path))
+    }),
+  )
+
+  it.live("skips Claude Code plugins with an unreadable manifest", () =>
+    Effect.gen(function* () {
+      const home = process.env.OPENCODE_TEST_HOME
+      if (!home) throw new Error("OPENCODE_TEST_HOME not set by test preload")
+      const tmp = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir({ git: true })),
+        (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+      )
+
+      yield* Effect.promise(() =>
+        Bun.write(path.join(home, ".claude", "plugins", "installed_plugins.json"), "{not valid json"),
+      )
+
+      yield* Effect.gen(function* () {
+        const skill = yield* Skill.Service
+        expect((yield* skill.all()).filter((s) => s.location !== "<built-in>")).toEqual([])
+      })
+        .pipe(
+          Effect.ensuring(Effect.promise(() => fs.rm(path.join(home, ".claude"), { recursive: true, force: true }))),
+        )
+        .pipe(provideInstance(tmp.path))
+    }),
+  )
+
+  it.live("deduplicates plugin skills discovered from multiple manifest entries", () =>
+    Effect.gen(function* () {
+      const home = process.env.OPENCODE_TEST_HOME
+      if (!home) throw new Error("OPENCODE_TEST_HOME not set by test preload")
+      const tmp = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir({ git: true })),
+        (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+      )
+
+      const pluginDir = path.join(".claude", "plugins", "cache", "marketplace", "demo-plugin")
+      yield* Effect.promise(() =>
+        createPluginSkill(
+          home,
+          path.join(pluginDir, "skills", "claude-plugin-skill"),
+          `---
+name: claude-plugin-skill
+description: A skill shipped inside a Claude Code plugin.
+---
+
+# Claude Plugin Skill
+`,
+        ),
+      )
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(home, ".claude", "plugins", "installed_plugins.json"),
+          JSON.stringify({
+            "demo-plugin-a": { name: "demo-plugin-a", path: path.join(home, pluginDir) },
+            "demo-plugin-b": { name: "demo-plugin-b", path: path.join(home, pluginDir) },
+          }),
+        ),
+      )
+
+      yield* Effect.gen(function* () {
+        const skill = yield* Skill.Service
+        const list = (yield* skill.all()).filter((s) => s.location !== "<built-in>")
+        expect(list.length).toBe(1)
+        expect(list[0].name).toBe("claude-plugin-skill")
+      })
+        .pipe(
+          Effect.ensuring(Effect.promise(() => fs.rm(path.join(home, ".claude"), { recursive: true, force: true }))),
+        )
+        .pipe(provideInstance(tmp.path))
+    }),
   )
 })

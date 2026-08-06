@@ -1,6 +1,6 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import path from "path"
-import { Effect, Layer, Context, Schema } from "effect"
+import { Effect, Layer, Context, Option, Schema } from "effect"
 import { NamedError } from "@opencode-ai/core/util/error"
 import type { Agent } from "@/agent/agent"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -20,7 +20,11 @@ import { escapeHtml } from "@/util/html"
 
 const CLAUDE_EXTERNAL_DIR = ".claude"
 const AGENTS_EXTERNAL_DIR = ".agents"
+const CLAUDE_PLUGINS_MANIFEST = ".claude/plugins/installed_plugins.json"
+const VSCODE_AGENT_PLUGINS_DIR = ".vscode/agent-plugins"
+const VSCODE_SERVER_AGENT_PLUGINS_DIR = ".vscode-server/data/agentPlugins"
 const EXTERNAL_SKILL_PATTERN = "skills/**/SKILL.md"
+const PLUGIN_SKILL_PATTERN = "**/skills/**/SKILL.md"
 const OPENCODE_SKILL_PATTERN = "{skill,skills}/**/SKILL.md"
 const SKILL_PATTERN = "**/SKILL.md"
 
@@ -170,6 +174,54 @@ const scan = Effect.fnUntraced(function* (
   }
 })
 
+// Best-effort scan of VS Code agent plugin folders. Each immediate plugin
+// directory may ship a `skills/` folder (optionally version-nested). Missing
+// or unreadable roots are skipped silently.
+const scanAgentPlugins = Effect.fnUntraced(function* (state: ScanState, fsys: FSUtil.Interface, root: string) {
+  if (!(yield* fsys.isDir(root))) return
+  const entries = yield* fsys
+    .readDirectoryEntries(root)
+    .pipe(Effect.catch(() => Effect.succeed([] as FSUtil.DirEntry[])))
+  for (const entry of entries) {
+    if (entry.type !== "directory" && entry.type !== "symlink") continue
+    yield* scan(state, path.join(root, entry.name), PLUGIN_SKILL_PATTERN, { dot: true, scope: "vscode-plugin" })
+  }
+})
+
+// Claude Code `installed_plugins.json` is a record or array of plugin entries
+// carrying an install `path`. Unknown shapes are ignored so discovery stays best-effort.
+const pluginPaths = (value: unknown) => {
+  if (!isRecord(value)) return []
+  const entries = Array.isArray(value) ? value : Object.values(value)
+  const paths: string[] = []
+  for (const entry of entries) {
+    if (!isRecord(entry)) continue
+    if (typeof entry.path !== "string" || entry.path.length === 0) continue
+    paths.push(entry.path)
+  }
+  return paths
+}
+
+// Best-effort scan of Claude Code plugin skills. Reads the installed plugin
+// manifest from the user home and scans each listed plugin directory for a
+// `skills/` folder. Missing or unreadable manifests are skipped silently.
+const scanClaudePlugins = Effect.fnUntraced(function* (
+  state: ScanState,
+  fsys: FSUtil.Interface,
+  global: Global.Interface,
+) {
+  const manifestPath = path.join(global.home, CLAUDE_PLUGINS_MANIFEST)
+  const text = yield* fsys.readFileStringSafe(manifestPath).pipe(Effect.catch(() => Effect.succeed(undefined)))
+  if (text === undefined) return
+  const manifest = Option.getOrUndefined(Schema.decodeUnknownOption(Schema.UnknownFromJsonString)(text))
+  if (manifest === undefined) return
+  for (const pluginPath of pluginPaths(manifest)) {
+    const expanded = pluginPath.startsWith("~/") ? path.join(global.home, pluginPath.slice(2)) : pluginPath
+    if (!path.isAbsolute(expanded) || !(yield* fsys.isDir(expanded))) continue
+    yield* scan(state, expanded, PLUGIN_SKILL_PATTERN, { dot: true, scope: "claude-plugin" })
+  }
+})
+
 const discoverSkills = Effect.fnUntraced(function* (
   config: Config.Interface,
   discovery: Discovery.Interface,
@@ -184,7 +236,10 @@ const discoverSkills = Effect.fnUntraced(function* (
 
   const externalDirs: string[] = []
   if (!disableExternalSkills) {
-    if (!disableClaudeCodeSkills) externalDirs.push(CLAUDE_EXTERNAL_DIR)
+    if (!disableClaudeCodeSkills) {
+      externalDirs.push(CLAUDE_EXTERNAL_DIR)
+      yield* scanClaudePlugins(state, fsys, global)
+    }
     externalDirs.push(AGENTS_EXTERNAL_DIR)
 
     for (const dir of externalDirs) {
@@ -192,6 +247,9 @@ const discoverSkills = Effect.fnUntraced(function* (
       if (!(yield* fsys.isDir(root))) continue
       yield* scan(state, root, EXTERNAL_SKILL_PATTERN, { dot: true, scope: "global" })
     }
+
+    yield* scanAgentPlugins(state, fsys, path.join(global.home, VSCODE_AGENT_PLUGINS_DIR))
+    yield* scanAgentPlugins(state, fsys, path.join(global.home, VSCODE_SERVER_AGENT_PLUGINS_DIR))
 
     const upDirs = yield* fsys
       .up({ targets: externalDirs, start: directory, stop: worktree })
